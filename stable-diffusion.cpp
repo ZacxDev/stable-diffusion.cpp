@@ -741,7 +741,15 @@ public:
         LOG_DEBUG("loading weights");
 
         std::set<std::string> ignore_tensors;
-        tensors["alphas_cumprod"] = alphas_cumprod_tensor;
+        // Always use computed alphas_cumprod, not values from model files.
+        // Reason: Some models (e.g. hassakuXLIllustrious) embed alphas_cumprod with
+        // F16 quantization that rounds the first value to 1.0 (should be 0.99915).
+        // This causes sigma[0] = sqrt((1-1)/1) = 0, breaking denoising → black images.
+        // The computed values use the standard SD/SDXL schedule (beta 0.00085→0.012)
+        // which all standard models expect. This matches how other scheduler tensors
+        // (alphas_cumprod_prev, sqrt_alphas_cumprod, etc.) are already handled as
+        // unused_tensors in model.cpp.
+        ignore_tensors.insert("alphas_cumprod");
         if (use_tiny_autoencoder) {
             ignore_tensors.insert("first_stage_model.");
         }
