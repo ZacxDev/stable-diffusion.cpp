@@ -13,3 +13,9 @@ output*.png
 models*
 *.log
 preview.png
+.direnv
+benchmark-models
+loras
+mybuild
+node_modules
+test-models
