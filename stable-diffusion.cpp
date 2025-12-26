@@ -2659,6 +2659,7 @@ const char* sample_method_to_str[] = {
     "lcm",
     "ddim_trailing",
     "tcd",
+    "dpm++3m_sde",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {

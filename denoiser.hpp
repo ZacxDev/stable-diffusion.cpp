@@ -1633,6 +1633,101 @@ static bool sample_k_diffusion(sample_method_t method,
                 }
             }
         } break;
+        case DPMPP3M_SDE_SAMPLE_METHOD:  // DPM-Solver++(3M) SDE from k-diffusion
+        {
+            // Ref: https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/sampling.py
+            struct ggml_tensor* noise      = ggml_dup_tensor(work_ctx, x);
+            struct ggml_tensor* denoised_1 = ggml_dup_tensor(work_ctx, x);
+            struct ggml_tensor* denoised_2 = ggml_dup_tensor(work_ctx, x);
+
+            float h_1 = 0.0f, h_2 = 0.0f;
+            bool has_h1 = false, has_h2 = false;
+
+            auto t_fn = [](float sigma) -> float { return -std::log(sigma); };
+
+            for (int i = 0; i < steps; i++) {
+                // Denoise
+                ggml_tensor* denoised = model(x, sigmas[i], i + 1);
+                if (denoised == nullptr) {
+                    return false;
+                }
+
+                float* vec_x            = (float*)x->data;
+                float* vec_denoised     = (float*)denoised->data;
+                float* vec_denoised_1   = (float*)denoised_1->data;
+                float* vec_denoised_2   = (float*)denoised_2->data;
+
+                if (sigmas[i + 1] == 0) {
+                    // Final step: x = denoised
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_denoised[j];
+                    }
+                } else {
+                    float t     = t_fn(sigmas[i]);
+                    float s     = t_fn(sigmas[i + 1]);
+                    float h     = s - t;
+                    float h_eta = h * (eta + 1.0f);
+
+                    // Base exponential integration coefficients
+                    float exp_neg_h_eta   = std::exp(-h_eta);
+                    float expm1_neg_h_eta = std::expm1(-h_eta);  // exp(-h_eta) - 1
+                    float a               = sigmas[i + 1] / sigmas[i] * std::exp(-h * eta);
+
+                    // Stage 1: x = a * x + (-expm1(-h_eta)) * denoised
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = a * vec_x[j] - expm1_neg_h_eta * vec_denoised[j];
+                    }
+
+                    // Stage 2 & 3: Multistep corrections using denoised history
+                    if (has_h2) {
+                        // Third-order correction with two history points
+                        float r0    = h_1 / h;
+                        float r1    = h_2 / h;
+                        float phi_2 = expm1_neg_h_eta / h_eta + 1.0f;
+                        float phi_3 = phi_2 / h_eta - 0.5f;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float d1_0 = (vec_denoised[j] - vec_denoised_1[j]) / r0;
+                            float d1_1 = (vec_denoised_1[j] - vec_denoised_2[j]) / r1;
+                            float d1   = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1);
+                            float d2   = (d1_0 - d1_1) / (r0 + r1);
+                            vec_x[j]   = vec_x[j] + phi_2 * d1 - phi_3 * d2;
+                        }
+                    } else if (has_h1) {
+                        // Second-order correction with one history point
+                        float r     = h_1 / h;
+                        float phi_2 = expm1_neg_h_eta / h_eta + 1.0f;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            float d  = (vec_denoised[j] - vec_denoised_1[j]) / r;
+                            vec_x[j] = vec_x[j] + phi_2 * d;
+                        }
+                    }
+
+                    // SDE noise injection (when eta > 0)
+                    if (eta > 0) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
+                        float noise_scale = sigmas[i + 1] * std::sqrt(-std::expm1(-2.0f * h * eta));
+                        float* vec_noise  = (float*)noise->data;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_noise[j] * noise_scale;
+                        }
+                    }
+
+                    // Update step size history
+                    h_2    = h_1;
+                    h_1    = h;
+                    has_h2 = has_h1;
+                    has_h1 = true;
+                }
+
+                // Shift denoised history: denoised_2 <- denoised_1 <- denoised
+                for (int j = 0; j < ggml_nelements(x); j++) {
+                    vec_denoised_2[j] = vec_denoised_1[j];
+                    vec_denoised_1[j] = vec_denoised[j];
+                }
+            }
+        } break;
 
         default:
             LOG_ERROR("Attempting to sample with nonexisting sample method %i", method);
