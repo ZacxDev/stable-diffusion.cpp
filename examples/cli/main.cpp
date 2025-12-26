@@ -594,7 +594,8 @@ int main(int argc, const char* argv[]) {
 
     if (gen_params.init_image_path.size() > 0) {
         vae_decode_only = false;
-        if (!load_image_and_update_size(gen_params.init_image_path, init_image)) {
+        // For UPSCALE mode, preserve original image dimensions (pass resize_image=false)
+        if (!load_image_and_update_size(gen_params.init_image_path, init_image, cli_params.mode != UPSCALE)) {
             return 1;
         }
     }
