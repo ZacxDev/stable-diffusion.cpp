@@ -472,12 +472,18 @@ int main(int argc, const char* argv[]) {
 
         int width       = 0;
         int height      = 0;
-        init_image.data = load_image_from_file(gen_params.init_image_path.c_str(), width, height, gen_params.width, gen_params.height);
+        // For UPSCALE mode, preserve original image dimensions (pass 0,0 to skip resize)
+        int expected_w  = (cli_params.mode == UPSCALE) ? 0 : gen_params.width;
+        int expected_h  = (cli_params.mode == UPSCALE) ? 0 : gen_params.height;
+        init_image.data = load_image_from_file(gen_params.init_image_path.c_str(), width, height, expected_w, expected_h);
         if (init_image.data == nullptr) {
             LOG_ERROR("load image from '%s' failed", gen_params.init_image_path.c_str());
             release_all_resources();
             return 1;
         }
+        // Update init_image dimensions with actual loaded size
+        init_image.width  = width;
+        init_image.height = height;
     }
 
     if (gen_params.end_image_path.size() > 0) {
