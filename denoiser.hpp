@@ -3,6 +3,7 @@
 
 #include "ggml_extend.hpp"
 #include "gits_noise.inl"
+#include "brownian_tree.hpp"
 
 /*================================================= CompVisDenoiser ==================================================*/
 
@@ -1645,6 +1646,18 @@ static bool sample_k_diffusion(sample_method_t method,
 
             auto t_fn = [](float sigma) -> float { return -std::log(sigma); };
 
+            // Create Brownian tree noise sampler for temporally-correlated noise
+            // This matches k-diffusion's BrownianTreeNoiseSampler for consistent fine details
+            std::vector<float> seed_vals = rng->randn(1);
+            uint64_t bt_seed = static_cast<uint64_t>(std::fabs(seed_vals[0]) * 1e9 + 1e10);
+
+            float sigma_min = sigmas[steps];  // Final sigma (smallest)
+            float sigma_max = sigmas[0];      // Initial sigma (largest)
+            if (sigma_min <= 0) sigma_min = 1e-6f;  // Avoid log(0)
+
+            BrownianTreeNoiseSampler brownian_sampler(
+                ggml_nelements(x), sigma_min, sigma_max, bt_seed);
+
             for (int i = 0; i < steps; i++) {
                 // Denoise
                 ggml_tensor* denoised = model(x, sigmas[i], i + 1);
@@ -1704,9 +1717,10 @@ static bool sample_k_diffusion(sample_method_t method,
                         }
                     }
 
-                    // SDE noise injection (when eta > 0)
+                    // SDE noise injection with Brownian tree (when eta > 0)
+                    // Uses temporally-correlated noise for consistent fine details
                     if (eta > 0) {
-                        ggml_ext_im_set_randn_f32(noise, rng);
+                        brownian_sampler.sample_tensor(sigmas[i], sigmas[i + 1], noise);
                         float noise_scale = sigmas[i + 1] * std::sqrt(-std::expm1(-2.0f * h * eta));
                         float* vec_noise  = (float*)noise->data;
                         for (int j = 0; j < ggml_nelements(x); j++) {
