@@ -3259,6 +3259,9 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
+    // Free GPU runtime buffer to make room for diffusion model (important for CPU offload mode)
+    sd_ctx->sd->cond_stage_model->free_compute_buffer();
+
     // Control net hint
     struct ggml_tensor* image_hint = nullptr;
     if (control_image.data != nullptr) {
@@ -4065,6 +4068,9 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
+
+    // Free GPU runtime buffer to make room for diffusion model (important for CPU offload mode)
+    sd_ctx->sd->cond_stage_model->free_compute_buffer();
 
     int W = width / vae_scale_factor;
     int H = height / vae_scale_factor;

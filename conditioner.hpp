@@ -32,6 +32,7 @@ struct Conditioner {
                                               const ConditionerParams& conditioner_params) = 0;
     virtual void alloc_params_buffer()                                                     = 0;
     virtual void free_params_buffer()                                                      = 0;
+    virtual void free_compute_buffer() {}  // Free GPU runtime buffer (for CPU offload mode)
     virtual void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors)    = 0;
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
@@ -1642,6 +1643,10 @@ struct LLMEmbedder : public Conditioner {
 
     void free_params_buffer() override {
         llm->free_params_buffer();
+    }
+
+    void free_compute_buffer() override {
+        llm->free_compute_buffer();
     }
 
     size_t get_params_buffer_size() override {
