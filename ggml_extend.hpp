@@ -1932,10 +1932,6 @@ protected:
                  buffer_size / (1024.f * 1024.f),
                  num_tensors,
                  (t1 - t0) * 1.0f / 1000);
-
-        // Log GPU memory status after freeing
-        std::string label = get_desc() + " after offload to CPU";
-        log_cuda_memory(label.c_str());
     }
 
 public:
@@ -2016,19 +2012,11 @@ public:
         free_cache_ctx();
     }
 
-    void free_compute_buffer(bool free_compute_buffer_immediately = false) {
-        std::string before_label = get_desc() + " before free_compute_buffer";
-        log_cuda_memory(before_label.c_str());
-
+    void free_compute_buffer() {
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
-            LOG_INFO("%s freed compute allocator", get_desc().c_str());
         }
-
-        std::string after_compute_label = get_desc() + " after freeing compute allocator";
-        log_cuda_memory(after_compute_label.c_str());
-
         offload_params_to_params_backend();
     }
 
