@@ -1392,7 +1392,9 @@ namespace LLM {
             auto get_graph = [&]() -> struct ggml_cgraph* {
                 return build_encode_image_graph(image);
             };
-            GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            // Use free_compute_buffer_immediately=true to properly free GPU resources after encode
+            // This allows subsequent compute() calls to work correctly with CPU offload mode
+            GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
         }
     };
 
