@@ -30,21 +30,16 @@
 
 #ifdef SD_USE_CUDA
 #include "ggml-cuda.h"
-#include <cuda_runtime.h>
 
-// Helper function to log current GPU memory status
+// Helper function to log current GPU memory status using ggml API
 static inline void log_cuda_memory(const char* label) {
     size_t free_mem = 0, total_mem = 0;
-    cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
-    if (err == cudaSuccess) {
-        LOG_INFO("[CUDA MEM] %s: Free=%.2f MB, Used=%.2f MB, Total=%.2f MB",
-                 label,
-                 free_mem / (1024.0 * 1024.0),
-                 (total_mem - free_mem) / (1024.0 * 1024.0),
-                 total_mem / (1024.0 * 1024.0));
-    } else {
-        LOG_WARN("[CUDA MEM] %s: cudaMemGetInfo failed: %s", label, cudaGetErrorString(err));
-    }
+    ggml_backend_cuda_get_device_memory(0, &free_mem, &total_mem);
+    LOG_INFO("[CUDA MEM] %s: Free=%.2f MB, Used=%.2f MB, Total=%.2f MB",
+             label,
+             free_mem / (1024.0 * 1024.0),
+             (total_mem - free_mem) / (1024.0 * 1024.0),
+             total_mem / (1024.0 * 1024.0));
 }
 #else
 static inline void log_cuda_memory(const char* label) {
