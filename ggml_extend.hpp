@@ -1889,6 +1889,10 @@ protected:
             ggml_backend_buffer_free(runtime_params_buffer);
             runtime_params_buffer = nullptr;
         }
+        // Synchronize to ensure GPU memory is actually freed before we try to allocate more
+        // This is critical for CPU offload mode where we need to free one model's memory
+        // before loading another model that wouldn't otherwise fit
+        ggml_backend_synchronize(runtime_backend);
         params_on_runtime_backend = false;
 
         int64_t t1 = ggml_time_ms();
