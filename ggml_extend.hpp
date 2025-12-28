@@ -30,6 +30,26 @@
 
 #ifdef SD_USE_CUDA
 #include "ggml-cuda.h"
+#include <cuda_runtime.h>
+
+// Helper function to log current GPU memory status
+static inline void log_cuda_memory(const char* label) {
+    size_t free_mem = 0, total_mem = 0;
+    cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (err == cudaSuccess) {
+        LOG_INFO("[CUDA MEM] %s: Free=%.2f MB, Used=%.2f MB, Total=%.2f MB",
+                 label,
+                 free_mem / (1024.0 * 1024.0),
+                 (total_mem - free_mem) / (1024.0 * 1024.0),
+                 total_mem / (1024.0 * 1024.0));
+    } else {
+        LOG_WARN("[CUDA MEM] %s: cudaMemGetInfo failed: %s", label, cudaGetErrorString(err));
+    }
+}
+#else
+static inline void log_cuda_memory(const char* label) {
+    (void)label;  // No-op when CUDA is not enabled
+}
 #endif
 
 #ifdef SD_USE_METAL
@@ -1824,12 +1844,27 @@ protected:
         num_tensors = ggml_tensor_num(offload_ctx);
         GGML_ASSERT(num_tensors == ggml_tensor_num(params_ctx));
 
+        // Calculate required memory and log current GPU state
+        size_t required_mem = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(offload_ctx); t != nullptr; t = ggml_get_next_tensor(offload_ctx, t)) {
+            required_mem += ggml_nbytes(t);
+        }
+        LOG_INFO("%s attempting to allocate %.2f MB on GPU (%i tensors)",
+                 get_desc().c_str(),
+                 required_mem / (1024.0 * 1024.0),
+                 (int)num_tensors);
+        std::string before_label = get_desc() + " before GPU alloc";
+        log_cuda_memory(before_label.c_str());
+
         runtime_params_buffer = ggml_backend_alloc_ctx_tensors(offload_ctx, runtime_backend);
 
         if (runtime_params_buffer == nullptr) {
-            LOG_ERROR("%s alloc runtime params backend buffer failed, num_tensors = %i",
+            LOG_ERROR("%s alloc runtime params backend buffer failed, num_tensors = %i, required %.2f MB",
                       get_desc().c_str(),
-                      num_tensors);
+                      num_tensors,
+                      required_mem / (1024.0 * 1024.0));
+            std::string fail_label = get_desc() + " GPU alloc FAILED";
+            log_cuda_memory(fail_label.c_str());
             return false;
         }
 
@@ -1901,6 +1936,10 @@ protected:
                  buffer_size / (1024.f * 1024.f),
                  num_tensors,
                  (t1 - t0) * 1.0f / 1000);
+
+        // Log GPU memory status after freeing
+        std::string label = get_desc() + " after offload to CPU";
+        log_cuda_memory(label.c_str());
     }
 
 public:
@@ -1981,11 +2020,19 @@ public:
         free_cache_ctx();
     }
 
-    void free_compute_buffer() {
+    void free_compute_buffer(bool free_compute_buffer_immediately = false) {
+        std::string before_label = get_desc() + " before free_compute_buffer";
+        log_cuda_memory(before_label.c_str());
+
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
+            LOG_INFO("%s freed compute allocator", get_desc().c_str());
         }
+
+        std::string after_compute_label = get_desc() + " after freeing compute allocator";
+        log_cuda_memory(after_compute_label.c_str());
+
         offload_params_to_params_backend();
     }
 
