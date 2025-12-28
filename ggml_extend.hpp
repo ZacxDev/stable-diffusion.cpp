@@ -1865,8 +1865,12 @@ protected:
         if (!params_on_runtime_backend) {
             return;
         }
+        int64_t t0 = ggml_time_ms();
+        size_t buffer_size = runtime_params_buffer != nullptr ? ggml_backend_buffer_get_size(runtime_params_buffer) : 0;
+
         ggml_tensor* t         = ggml_get_first_tensor(params_ctx);
         ggml_tensor* offload_t = ggml_get_first_tensor(offload_ctx);
+        int num_tensors = 0;
 
         while (t != nullptr && offload_t != nullptr) {
             t->buffer         = offload_t->buffer;
@@ -1878,6 +1882,7 @@ protected:
 
             t         = ggml_get_next_tensor(params_ctx, t);
             offload_t = ggml_get_next_tensor(offload_ctx, offload_t);
+            num_tensors++;
         }
 
         if (runtime_params_buffer != nullptr) {
@@ -1885,6 +1890,13 @@ protected:
             runtime_params_buffer = nullptr;
         }
         params_on_runtime_backend = false;
+
+        int64_t t1 = ggml_time_ms();
+        LOG_INFO("%s offload params (%6.2f MB, %i tensors) back to CPU, freeing GPU memory, taking %.2fs",
+                 get_desc().c_str(),
+                 buffer_size / (1024.f * 1024.f),
+                 num_tensors,
+                 (t1 - t0) * 1.0f / 1000);
     }
 
 public:
