@@ -32,14 +32,15 @@
 #include "ggml-cuda.h"
 
 // Helper function to log current GPU memory status using ggml API
+// Note: Uses fprintf since LOG_INFO isn't defined until util.h is included later
 static inline void log_cuda_memory(const char* label) {
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_cuda_get_device_memory(0, &free_mem, &total_mem);
-    LOG_INFO("[CUDA MEM] %s: Free=%.2f MB, Used=%.2f MB, Total=%.2f MB",
-             label,
-             free_mem / (1024.0 * 1024.0),
-             (total_mem - free_mem) / (1024.0 * 1024.0),
-             total_mem / (1024.0 * 1024.0));
+    fprintf(stderr, "[INFO ] [CUDA MEM] %s: Free=%.2f MB, Used=%.2f MB, Total=%.2f MB\n",
+            label,
+            free_mem / (1024.0 * 1024.0),
+            (total_mem - free_mem) / (1024.0 * 1024.0),
+            total_mem / (1024.0 * 1024.0));
 }
 #else
 static inline void log_cuda_memory(const char* label) {
