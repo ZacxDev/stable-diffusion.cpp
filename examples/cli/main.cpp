@@ -36,6 +36,7 @@ struct SDCliParams {
     bool verbose          = false;
     bool canny_preprocess = false;
     bool convert_name     = false;
+    bool upscale_info     = false;
 
     preview_t preview_method = PREVIEW_NONE;
     int preview_interval     = 1;
@@ -97,6 +98,10 @@ struct SDCliParams {
              "--preview-noisy",
              "enables previewing noisy inputs of the models rather than the denoised outputs",
              true, &preview_noisy},
+            {"",
+             "--upscale-info",
+             "print upscaler model information (architecture, scale) and exit",
+             true, &upscale_info},
 
         };
 
@@ -217,9 +222,11 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
         exit(cli_params.normal_exit ? 0 : 1);
     }
 
+    // Skip full validation when just getting upscaler info
+    bool upscale_info_only = cli_params.upscale_info && ctx_params.esrgan_path.size() > 0;
     if (!cli_params.process_and_check() ||
-        !ctx_params.process_and_check(cli_params.mode) ||
-        !gen_params.process_and_check(cli_params.mode, ctx_params.lora_model_dir)) {
+        (!upscale_info_only && !ctx_params.process_and_check(cli_params.mode)) ||
+        (!upscale_info_only && !gen_params.process_and_check(cli_params.mode, ctx_params.lora_model_dir))) {
         print_usage(argc, argv, options_vec);
         exit(1);
     }
@@ -433,6 +440,26 @@ int main(int argc, const char* argv[]) {
                      ctx_params.vae_path.c_str(),
                      cli_params.output_path.c_str());
             return 0;
+        }
+    }
+
+    // Handle --upscale-info: print model info and exit
+    if (cli_params.upscale_info && ctx_params.esrgan_path.size() > 0) {
+        upscaler_ctx_t* upscaler_ctx = new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
+                                                        ctx_params.offload_params_to_cpu,
+                                                        ctx_params.diffusion_conv_direct,
+                                                        ctx_params.n_threads,
+                                                        gen_params.upscale_tile_size);
+        if (upscaler_ctx) {
+            printf("Upscaler Model Info:\n");
+            printf("  Path: %s\n", ctx_params.esrgan_path.c_str());
+            printf("  Architecture: %s\n", get_upscaler_desc(upscaler_ctx));
+            printf("  Scale Factor: %d\n", get_upscale_factor(upscaler_ctx));
+            free_upscaler_ctx(upscaler_ctx);
+            return 0;
+        } else {
+            LOG_ERROR("failed to load upscaler model");
+            return 1;
         }
     }
 

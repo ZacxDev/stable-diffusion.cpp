@@ -385,6 +385,9 @@ SD_API sd_image_t upscale(upscaler_ctx_t* upscaler_ctx,
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
+// Returns upscaler architecture description ("esrgan" for RRDBNet, "srvgg" for SRVGGNetCompact)
+SD_API const char* get_upscaler_desc(upscaler_ctx_t* upscaler_ctx);
+
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
                     const char* output_path,

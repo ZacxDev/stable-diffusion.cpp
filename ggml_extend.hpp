@@ -1208,6 +1208,61 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_ones(struct ggml_context* ctx,
     return ggml_ext_full(ctx, 1.f, ne0, ne1, ne2, ne3);
 }
 
+// PixelShuffle (depth-to-space) operation for upscaling
+// Rearranges channels into spatial dimensions, used by SRVGGNetCompact
+// Input:  [W, H, C*r*r, N] in ggml order (PyTorch: [N, C*r*r, H, W])
+// Output: [W*r, H*r, C, N] in ggml order (PyTorch: [N, C, H*r, W*r])
+// upscale_factor r must be 2, 3, or 4
+__STATIC_INLINE__ struct ggml_tensor* ggml_ext_pixel_shuffle(struct ggml_context* ctx,
+                                                              struct ggml_tensor* x,
+                                                              int upscale_factor) {
+    int r = upscale_factor;
+    GGML_ASSERT(r == 2 || r == 3 || r == 4);
+
+    int64_t W    = x->ne[0];
+    int64_t H    = x->ne[1];
+    int64_t C_in = x->ne[2];
+    int64_t N    = x->ne[3];
+
+    GGML_ASSERT(C_in % (r * r) == 0);
+    int64_t C = C_in / (r * r);
+
+    // The transformation is equivalent to PyTorch:
+    //   x.view(N, C, r, r, H, W).permute(0,1,4,2,5,3).reshape(N, C, H*r, W*r)
+    // In ggml 4D, we achieve this via multiple reshape/permute steps:
+
+    // Step 1: Reshape to separate r*r from output channels
+    // [W, H, C*r*r, N] -> [W, H, r*r, C*N]
+    auto t = ggml_reshape_4d(ctx, x, W, H, r * r, C * N);
+
+    // Step 2: Split r*r into two r factors (dx and dy)
+    // [W, H, r*r, C*N] -> [W, H, r, r*C*N]
+    // Here dim2 = r corresponds to dx (width offset), dim3 contains dy*C*N
+    t = ggml_reshape_4d(ctx, t, W, H, r, r * C * N);
+
+    // Step 3: Permute to interleave dx with W
+    // [W, H, r_x, r_y*C*N] -> [r_x, W, r_y*C*N, H]
+    // permute(2, 0, 3, 1) maps: new[0]=old[2], new[1]=old[0], new[2]=old[3], new[3]=old[1]
+    t = ggml_permute(ctx, t, 2, 0, 3, 1);
+    t = ggml_cont(ctx, t);
+
+    // Step 4: Reshape to merge r_x*W and separate r_y
+    // [r_x, W, r_y*C*N, H] -> [r_x*W, r_y, C*N, H]
+    t = ggml_reshape_4d(ctx, t, r * W, r, C * N, H);
+
+    // Step 5: Permute to interleave r_y with H
+    // [W*r, r_y, C*N, H] -> [W*r, r_y, H, C*N]
+    // permute(0, 1, 3, 2) swaps dim2 and dim3
+    t = ggml_permute(ctx, t, 0, 1, 3, 2);
+    t = ggml_cont(ctx, t);
+
+    // Step 6: Final reshape to merge r_y*H and restore C, N
+    // [W*r, r_y, H, C*N] -> [W*r, r_y*H, C, N] = [W*r, H*r, C, N]
+    t = ggml_reshape_4d(ctx, t, W * r, r * H, C, N);
+
+    return t;
+}
+
 __STATIC_INLINE__ ggml_tensor* ggml_ext_cast_f32(ggml_context* ctx, ggml_tensor* a) {
 #ifdef SD_USE_VULKAN
     auto zero_index = ggml_get_tensor(ctx, "ggml_runner_build_in_tensor:zero_int");
@@ -2222,6 +2277,53 @@ class Identity : public UnaryBlock {
 public:
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
         return x;
+    }
+};
+
+// Parametric ReLU activation with learnable per-channel slopes
+// PReLU(x) = max(0,x) + slope * min(0,x) = relu(x) - slope * relu(-x)
+// Used by SRVGGNetCompact in Real-ESRGAN
+class PReLU : public UnaryBlock {
+protected:
+    int64_t num_parameters;  // number of learnable slope parameters (typically num_feat=64)
+
+    void init_params(struct ggml_context* ctx,
+                     const String2TensorStorage& tensor_storage_map = {},
+                     const std::string prefix                       = "") override {
+        // PReLU slopes stored as 1D tensor of shape [num_parameters]
+        params["weight"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_parameters);
+    }
+
+public:
+    PReLU(int64_t num_parameters = 1)
+        : num_parameters(num_parameters) {}
+
+    struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
+        // x shape: [W, H, C, N] in ggml order where C should match num_parameters
+        // PReLU(x) = relu(x) - slope * relu(-x)
+
+        struct ggml_tensor* slope = params["weight"];
+
+        // Compute relu(x) - positive part
+        auto relu_pos = ggml_relu(ctx->ggml_ctx, x);
+
+        // Compute relu(-x) - magnitude of negative part
+        auto neg_x    = ggml_neg(ctx->ggml_ctx, x);
+        auto relu_neg = ggml_relu(ctx->ggml_ctx, neg_x);
+
+        // Reshape slope for broadcasting: [num_parameters] -> [1, 1, num_parameters, 1]
+        // This allows element-wise multiplication along the channel dimension (ne[2])
+        auto slope_4d = ggml_reshape_4d(ctx->ggml_ctx, slope, 1, 1, num_parameters, 1);
+
+        // Multiply relu_neg by slope with broadcasting
+        auto scaled_neg = ggml_mul(ctx->ggml_ctx, relu_neg, slope_4d);
+
+        // Final result: relu(x) - slope * relu(-x)
+        return ggml_sub(ctx->ggml_ctx, relu_pos, scaled_neg);
+    }
+
+    std::string get_desc() {
+        return "PReLU";
     }
 };
 
