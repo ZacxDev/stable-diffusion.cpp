@@ -61,6 +61,7 @@ struct UpscalerGGML {
         if (!esrgan_upscaler->load_from_file(esrgan_path, n_threads)) {
             return false;
         }
+        LOG_INFO("Loaded upscaler: %s (scale=%d)", esrgan_upscaler->get_desc().c_str(), esrgan_upscaler->scale);
         return true;
     }
 
@@ -147,6 +148,15 @@ int get_upscale_factor(upscaler_ctx_t* upscaler_ctx) {
         return 1;
     }
     return upscaler_ctx->upscaler->esrgan_upscaler->scale;
+}
+
+const char* get_upscaler_desc(upscaler_ctx_t* upscaler_ctx) {
+    static std::string desc;
+    if (upscaler_ctx == nullptr || upscaler_ctx->upscaler == nullptr || upscaler_ctx->upscaler->esrgan_upscaler == nullptr) {
+        return "unknown";
+    }
+    desc = upscaler_ctx->upscaler->esrgan_upscaler->get_desc();
+    return desc.c_str();
 }
 
 void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx) {

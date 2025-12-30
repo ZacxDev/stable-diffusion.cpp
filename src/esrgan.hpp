@@ -3,6 +3,107 @@
 
 #include "ggml_extend.hpp"
 #include "model.h"
+#include "srvgg.hpp"
+
+// Upscaler architecture types
+enum class UpscalerArchitecture {
+    RRDB_NET,   // RealESRGAN_x4plus, anime_6B (existing, ~16M params)
+    SRVGG_NET,  // realesr-animevideov3, general-x4v3 (fast, ~1.5-3M params)
+    UNKNOWN
+};
+
+// Detect upscaler architecture from tensor names
+// RRDBNet: Contains "RDB", "rdb", or "model.1.sub." patterns
+// SRVGGNet: Sequential body.N.weight pattern without RDB, no rdb blocks
+inline UpscalerArchitecture detect_upscaler_architecture(const std::vector<std::string>& tensor_names) {
+    bool has_rdb       = false;
+    bool has_body      = false;
+    int max_body_idx   = -1;
+
+    for (const auto& name : tensor_names) {
+        // RRDBNet indicators: contains RDB block references
+        if (name.find("RDB") != std::string::npos ||
+            name.find("rdb") != std::string::npos ||
+            name.find("model.1.sub.") != std::string::npos) {
+            has_rdb = true;
+        }
+
+        // SRVGGNet pattern: body.N.weight without RDB
+        // body.0 = conv_first, body.1 = prelu_first, body.2 = body_conv.0, etc.
+        if (name.find("body.") == 0) {
+            has_body       = true;
+            size_t dot_pos = name.find('.', 5);
+            if (dot_pos != std::string::npos) {
+                try {
+                    int idx      = std::stoi(name.substr(5, dot_pos - 5));
+                    max_body_idx = std::max(max_body_idx, idx);
+                } catch (...) {
+                }
+            }
+        }
+    }
+
+    // RRDBNet takes priority if RDB patterns found
+    if (has_rdb) {
+        return UpscalerArchitecture::RRDB_NET;
+    }
+
+    // SRVGGNet: has body.N pattern without RDB, and body indices > 2
+    // (body.0=conv_first, body.1=prelu, body.2+=body convs)
+    if (has_body && max_body_idx >= 2 && !has_rdb) {
+        return UpscalerArchitecture::SRVGG_NET;
+    }
+
+    return UpscalerArchitecture::UNKNOWN;
+}
+
+// Detect SRVGGNet parameters from tensor names
+// Returns: {num_conv, upscale}
+// num_conv = (max_body_idx - 1) / 2  (body.0=conv_first, body.1=prelu, then pairs)
+// upscale derived from conv_last output channels: channels = 3 * r * r
+inline std::pair<int, int> detect_srvgg_params(const std::vector<std::string>& tensor_names,
+                                                const std::function<std::vector<int64_t>(const std::string&)>& get_shape) {
+    int max_body_idx = -1;
+    int upscale      = 4;  // default
+
+    for (const auto& name : tensor_names) {
+        if (name.find("body.") == 0) {
+            size_t dot_pos = name.find('.', 5);
+            if (dot_pos != std::string::npos) {
+                try {
+                    int idx      = std::stoi(name.substr(5, dot_pos - 5));
+                    max_body_idx = std::max(max_body_idx, idx);
+                } catch (...) {
+                }
+            }
+        }
+    }
+
+    // num_conv: subtract conv_first(0) and prelu_first(1), then divide by 2 (conv+prelu pairs)
+    // max_body_idx = 1 + num_conv*2 + 1 (for conv_last)
+    // So: num_conv = (max_body_idx - 2) / 2
+    int num_conv = (max_body_idx >= 2) ? (max_body_idx - 2) / 2 : 16;
+
+    // Detect upscale from conv_last output channels
+    // conv_last.weight has shape [out_ch, in_ch, kH, kW]
+    // out_ch = num_out_ch * upscale^2 = 3 * r^2
+    std::string conv_last_name = "body." + std::to_string(max_body_idx) + ".weight";
+    if (get_shape) {
+        auto shape = get_shape(conv_last_name);
+        if (shape.size() >= 1) {
+            int out_ch = static_cast<int>(shape[0]);
+            // out_ch = 3 * r^2, solve for r
+            if (out_ch == 12)
+                upscale = 2;  // 3*2*2
+            else if (out_ch == 27)
+                upscale = 3;  // 3*3*3
+            else if (out_ch == 48)
+                upscale = 4;  // 3*4*4
+        }
+    }
+
+    return {num_conv, upscale};
+}
 
 /*
     ===================================    ESRGAN  ===================================
@@ -150,7 +251,9 @@ public:
 };
 
 struct ESRGAN : public GGMLRunner {
+    UpscalerArchitecture arch_type = UpscalerArchitecture::UNKNOWN;
     std::unique_ptr<RRDBNet> rrdb_net;
+    std::unique_ptr<SRVGGNetCompact> srvgg_net;
     int scale     = 4;
     int tile_size = 128;  // avoid cuda OOM for 4gb VRAM
 
@@ -163,7 +266,85 @@ struct ESRGAN : public GGMLRunner {
     }
 
     std::string get_desc() override {
+        if (arch_type == UpscalerArchitecture::SRVGG_NET) {
+            return "srvgg";
+        }
         return "esrgan";
+    }
+
+    UpscalerArchitecture get_arch_type() const { return arch_type; }
+
+    // Load SRVGGNetCompact model with weight name mapping
+    // Weight format: body.0=conv_first, body.1=prelu_first, body.2/3=body_conv/prelu.0, etc.
+    bool load_srvgg_from_loader(ModelLoader& model_loader, const std::vector<std::string>& tensor_names, int n_threads) {
+        // Get shape helper for parameter detection using tensor storage map
+        auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+        auto get_shape           = [&tensor_storage_map](const std::string& name) -> std::vector<int64_t> {
+            auto it = tensor_storage_map.find(name);
+            if (it != tensor_storage_map.end()) {
+                std::vector<int64_t> shape;
+                for (int i = 0; i < it->second.n_dims; i++) {
+                    shape.push_back(it->second.ne[i]);
+                }
+                return shape;
+            }
+            return {};
+        };
+
+        // Detect parameters
+        auto [detected_num_conv, detected_scale] = detect_srvgg_params(tensor_names, get_shape);
+        LOG_INFO("detected SRVGGNetCompact: num_conv=%d, scale=%d", detected_num_conv, detected_scale);
+
+        // Create SRVGGNetCompact
+        srvgg_net = std::make_unique<SRVGGNetCompact>(detected_scale, detected_num_conv, 3, 3, 64);
+        srvgg_net->init(params_ctx, {}, "");
+
+        alloc_params_buffer();
+        std::map<std::string, ggml_tensor*> srvgg_tensors;
+        srvgg_net->get_param_tensors(srvgg_tensors);
+
+        // Build name mapping: internal name -> file name
+        // body.0 = conv_first, body.1 = prelu_first
+        // body.2 = body_conv.0, body.3 = body_prelu.0
+        // ...
+        // body.N = conv_last (N = 2 + num_conv*2)
+        std::map<std::string, std::string> name_mapping;
+        name_mapping["conv_first.weight"]  = "body.0.weight";
+        name_mapping["conv_first.bias"]    = "body.0.bias";
+        name_mapping["prelu_first.weight"] = "body.1.weight";
+
+        for (int i = 0; i < detected_num_conv; i++) {
+            int conv_idx  = 2 + i * 2;
+            int prelu_idx = 3 + i * 2;
+            name_mapping["body_conv." + std::to_string(i) + ".weight"]  = "body." + std::to_string(conv_idx) + ".weight";
+            name_mapping["body_conv." + std::to_string(i) + ".bias"]    = "body." + std::to_string(conv_idx) + ".bias";
+            name_mapping["body_prelu." + std::to_string(i) + ".weight"] = "body." + std::to_string(prelu_idx) + ".weight";
+        }
+
+        int conv_last_idx                 = 2 + detected_num_conv * 2;
+        name_mapping["conv_last.weight"]  = "body." + std::to_string(conv_last_idx) + ".weight";
+        name_mapping["conv_last.bias"]    = "body." + std::to_string(conv_last_idx) + ".bias";
+
+        // Map internal tensor names to file tensor names
+        std::map<std::string, ggml_tensor*> file_tensors;
+        for (auto& p : srvgg_tensors) {
+            auto it = name_mapping.find(p.first);
+            if (it != name_mapping.end()) {
+                file_tensors[it->second] = p.second;
+            } else {
+                LOG_WARN("unmapped tensor: %s", p.first.c_str());
+            }
+        }
+
+        bool success = model_loader.load_tensors(file_tensors, {}, n_threads);
+        if (!success) {
+            LOG_ERROR("load srvgg tensors from model loader failed");
+            return false;
+        }
+
+        scale = srvgg_net->get_scale();
+        LOG_INFO("SRVGGNetCompact model loaded with scale=%d, num_conv=%d", scale, detected_num_conv);
+        return true;
     }
 
     bool load_from_file(const std::string& file_path, int n_threads) {
@@ -177,6 +358,17 @@ struct ESRGAN : public GGMLRunner {
 
         // Get tensor names
         auto tensor_names = model_loader.get_tensor_names();
+
+        // Detect architecture type first
+        arch_type = detect_upscaler_architecture(tensor_names);
+
+        // Handle SRVGGNet models
+        if (arch_type == UpscalerArchitecture::SRVGG_NET) {
+            return load_srvgg_from_loader(model_loader, tensor_names, n_threads);
+        }
+
+        // Fall back to RRDBNet loading (original code path)
+        arch_type = UpscalerArchitecture::RRDB_NET;
 
         // Detect if it's ESRGAN format
         bool is_ESRGAN = std::find(tensor_names.begin(), tensor_names.end(), "model.0.weight") != tensor_names.end();
@@ -342,14 +534,29 @@ struct ESRGAN : public GGMLRunner {
     }
 
     struct ggml_cgraph* build_graph(struct ggml_tensor* x) {
-        if (!rrdb_net)
-            return nullptr;
+        // Check that we have a valid network
+        if (arch_type == UpscalerArchitecture::SRVGG_NET) {
+            if (!srvgg_net)
+                return nullptr;
+        } else {
+            if (!rrdb_net)
+                return nullptr;
+        }
+
         constexpr int kGraphNodes = 1 << 16;  // 65k
         struct ggml_cgraph* gf    = new_graph_custom(kGraphNodes);
         x                         = to_backend(x);
 
         auto runner_ctx         = get_context();
-        struct ggml_tensor* out = rrdb_net->forward(&runner_ctx, x);
+        struct ggml_tensor* out = nullptr;
+
+        // Dispatch based on architecture type
+        if (arch_type == UpscalerArchitecture::SRVGG_NET) {
+            out = srvgg_net->forward(&runner_ctx, x);
+        } else {
+            out = rrdb_net->forward(&runner_ctx, x);
+        }
+
         ggml_build_forward_expand(gf, out);
         return gf;
     }
